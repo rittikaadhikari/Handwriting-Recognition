@@ -1,11 +1,14 @@
 import argparse
 import cv2
 from emnist import extract_training_samples, extract_test_samples
+from emnist_net import EmnistNet
 import joblib
 import matplotlib.pyplot as plt
 import numpy as np
 import random
 from sklearn import ensemble
+import torch
+
 
 letters = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", 
            "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"]
@@ -37,26 +40,100 @@ def load_data(plot=True):
 """
 Train a random forest on train data, evaluate on test data, and save, if specified.
 """
-def train(x_train, x_test, y_train, y_test, save=True, model_path="emnist_classifier.joblib"):
-    # fit a classifier
-    classifier = ensemble.RandomForestClassifier(n_estimators=100)
-    classifier.fit(x_train, y_train)
+def train(x_train, x_test, y_train, y_test, model, save=True, batch_size=32, num_epochs=50, log_interval=100):
+    # set labels to be 0-indexed
+    y_train = y_train - 1
+    y_test = y_test - 1
 
-    # print score on test data
-    scores = classifier.score(x_test, y_test)
-    print(f"Classification Accuracy (Test): {scores}")
+    if model == "random_forest":
+        # fit a classifier
+        classifier = ensemble.RandomForestClassifier(n_estimators=100)
+        classifier.fit(x_train, y_train)
 
-    # save models
-    if save:
-        joblib.dump(classifier, model_path)
-    
-    return classifier
+        # print score on test data
+        scores = classifier.score(x_test, y_test)
+        print(f"Classification Accuracy (Test): {scores}")
+
+        # save models
+        if save:
+            joblib.dump(classifier, "emnist_random_forest.joblib")
+        
+        return classifier
+    elif model == "neural_net":
+        # create model
+        model = EmnistNet()
+        model.train()
+
+        # create train batches
+        train_idx = np.array(list(range(len(x_train))))
+        np.random.shuffle(train_idx)
+        train_batches = np.split(train_idx, batch_size)
+
+        # train model
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        for epoch in range(num_epochs):
+            for batch_idx, batch in enumerate(train_batches):
+                ims, labels = x_train[batch], y_train[batch]
+                ims = ims.reshape(ims.shape[:-1] + (1, 28, 28))
+                ims, labels = torch.Tensor(ims), torch.Tensor(labels).type(torch.LongTensor)
+                optimizer.zero_grad()
+                outputs = model(ims)
+                loss = torch.nn.functional.nll_loss(outputs, labels)
+                optimizer.step()
+
+                # log
+                if batch_idx % log_interval == 0:
+                    print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+                          epoch, batch_idx * len(ims), len(x_train),
+                          100. * batch_idx / len(x_train), loss.item()))
+
+        # create test batches
+        test_idx = np.array(list(range(len(x_test))))
+        np.random.shuffle(test_idx)
+        test_batches = np.split(test_idx, batch_size)
+
+        # test model
+        model.eval()
+        test_loss, correct = 0, 0
+        with torch.no_grad():
+            for batch in test_batches:
+                ims, labels = x_test[batch], y_test[batch]
+                ims = ims.reshape(ims.shape[:-1] + (1, 28, 28))
+                ims, labels = torch.Tensor(ims), torch.Tensor(labels).type(torch.LongTensor)
+                outputs = model(ims)
+
+                # sum up batch loss
+                test_loss += torch.nn.functional.nll_loss(outputs, labels, reduction='sum').item()
+
+                # get the index of the max log-probability
+                pred = outputs.argmax(dim=1, keepdim=True)
+                correct += pred.eq(labels.view_as(pred)).sum().item()
+                
+        test_loss /= len(x_test)
+
+        # log test results
+        print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
+              test_loss, correct, len(x_test),
+              100. * correct / len(x_test)))
+            
+        if save:
+            torch.save(model.state_dict(), "emnist_neural_net.pt")
+    else:
+        raise Exception(f"Invalid model type: {model}. Please choose from 'random_forest' or 'neural_net'.")
 
 """ 
-Load model from saved .joblib
+Load model from saved path
 """
 def load(model_path):
-    return joblib.load(model_path)
+    if model_path == "emnist_random_forest.joblib":
+        return joblib.load(model_path)
+    elif model_path == "emnist_neural_net.pt":
+        model = EmnistNet()
+        model.load_state_dict(torch.load(model_path))
+        model.eval()
+        return model
+    else:
+        raise Exception(f"Cannot load model from provided model path: {model_path}.")
 
 """
 Detect and remove lines from image. (lined paper)
@@ -185,7 +262,7 @@ def predict(im_path, model, pad=5):
         cv2.imwrite(f"segmented/roi{i}.jpg", roi) # write ROI to folder for debugging
 
         # predict letter for ROI
-        pred += letters[model.predict([roi.flatten()])[0] - 1]
+        pred += letters[model.predict([roi.flatten()])[0]]
 
         # draw bounding box
         cv2.rectangle(im, (x - pad, y - pad), (x2 + pad, y2 + pad), (0, 0, 255), 2)
@@ -197,16 +274,16 @@ def predict(im_path, model, pad=5):
 if __name__ == "__main__":
     # parse arguments
     parser = argparse.ArgumentParser(description="Train & use a model to translate handwriting to text.")
-    parser.add_argument("--train", action="store_true", required=False)
+    parser.add_argument("--train", action="store", type=str, choices=["random_forest", "neural_net"], required=False)
     parser.add_argument("--plot-data", action="store_true", required=False)
     parser.add_argument("--input", action="store", type=str, required=False)
-    parser.add_argument("--classifier", action="store", type=str, default="emnist_classifier.joblib", required=False)
+    parser.add_argument("--classifier", action="store", type=str, choices=["emnist_random_forest.joblib", "emnist_neural_net.pt"], required=False)
     args = parser.parse_args()
 
     # train on emnist
     if args.train:
         x_train, x_test, y_train, y_test = load_data(plot=args.plot_data)
-        classifier = train(x_train, x_test, y_train, y_test, save=args.classifier)
+        classifier = train(x_train, x_test, y_train, y_test, args.train, save=True)
 
     # predict provided input
     if args.input:
