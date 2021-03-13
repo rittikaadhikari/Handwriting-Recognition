@@ -8,6 +8,7 @@ import numpy as np
 import random
 from sklearn import ensemble
 import torch
+from tqdm import tqdm
 
 
 letters = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", 
@@ -40,10 +41,11 @@ def load_data(plot=True):
 """
 Train a random forest on train data, evaluate on test data, and save, if specified.
 """
-def train(x_train, x_test, y_train, y_test, model, save=True, batch_size=32, num_epochs=50, log_interval=100):
+def train(x_train, x_test, y_train, y_test, model, save=True, num_batches=32, num_epochs=50, log_interval=100):
     # set labels to be 0-indexed
     y_train = y_train - 1
     y_test = y_test - 1
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     if model == "random_forest":
         # fit a classifier
@@ -67,59 +69,60 @@ def train(x_train, x_test, y_train, y_test, model, save=True, batch_size=32, num
         # create train batches
         train_idx = np.array(list(range(len(x_train))))
         np.random.shuffle(train_idx)
-        train_batches = np.split(train_idx, batch_size)
+        train_batches = np.split(train_idx, num_batches)
+        x_train = torch.from_numpy(x_train.astype(np.float32)).to(device)
+        x_test = torch.from_numpy(x_test.astype(np.float32)).to(device)
+        y_train = torch.from_numpy(y_train.astype(np.int64)).to(device)
+        y_test = torch.from_numpy(y_test.astype(np.int64)).to(device)
+        model = model.to(device)
 
         # train model
-        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
-        for epoch in range(num_epochs):
-            for batch_idx, batch in enumerate(train_batches):
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+        t_epoch = tqdm(range(num_epochs), position=0)
+        for epoch in t_epoch:
+            t = tqdm(train_batches, leave=False, position=1)
+            model.train()
+            for batch_idx, batch in enumerate(t):
                 ims, labels = x_train[batch], y_train[batch]
+
                 ims = ims.reshape(ims.shape[:-1] + (1, 28, 28))
-                ims, labels = torch.Tensor(ims), torch.Tensor(labels).type(torch.LongTensor)
                 optimizer.zero_grad()
                 outputs = model(ims)
                 loss = torch.nn.functional.nll_loss(outputs, labels)
+                loss.backward()
                 optimizer.step()
+                t.set_postfix({"Loss": loss.item()})
 
-                # log
-                if batch_idx % log_interval == 0:
-                    print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
-                          epoch, batch_idx * len(ims), len(x_train),
-                          100. * batch_idx / len(x_train), loss.item()))
+            # create test batches
+            test_idx = np.array(list(range(len(x_test))))
+            np.random.shuffle(test_idx)
+            test_batches = np.split(test_idx, num_batches)
 
-        # create test batches
-        test_idx = np.array(list(range(len(x_test))))
-        np.random.shuffle(test_idx)
-        test_batches = np.split(test_idx, batch_size)
+            # test model
+            model.eval()
+            test_loss, correct = 0, 0
+            with torch.no_grad():
+                for batch in test_batches:
+                    ims, labels = x_test[batch], y_test[batch]
+                    ims = ims.reshape(ims.shape[:-1] + (1, 28, 28))
+                    outputs = model(ims)
 
-        # test model
-        model.eval()
-        test_loss, correct = 0, 0
-        with torch.no_grad():
-            for batch in test_batches:
-                ims, labels = x_test[batch], y_test[batch]
-                ims = ims.reshape(ims.shape[:-1] + (1, 28, 28))
-                ims, labels = torch.Tensor(ims), torch.Tensor(labels).type(torch.LongTensor)
-                outputs = model(ims)
+                    # sum up batch loss
+                    test_loss += torch.nn.functional.nll_loss(outputs, labels, reduction='sum').item()
 
-                # sum up batch loss
-                test_loss += torch.nn.functional.nll_loss(outputs, labels, reduction='sum').item()
+                    # get the index of the max log-probability
+                    pred = outputs.argmax(dim=1, keepdim=True)
+                    correct += pred.eq(labels.view_as(pred)).sum().item()
+                    
+            test_loss /= len(x_test)
 
-                # get the index of the max log-probability
-                pred = outputs.argmax(dim=1, keepdim=True)
-                correct += pred.eq(labels.view_as(pred)).sum().item()
-                
-        test_loss /= len(x_test)
-
-        # log test results
-        print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
-              test_loss, correct, len(x_test),
-              100. * correct / len(x_test)))
-            
+            # log test results
+            t_epoch.set_postfix({"Average Loss": test_loss, "Accuracy": 100. * correct / len(x_test)})
+            # print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
+            #     test_loss, correct, len(x_test),
+            #     100. * correct / len(x_test)))
         if save:
-            torch.save(model.state_dict(), "emnist_neural_net.pt")
-    else:
-        raise Exception(f"Invalid model type: {model}. Please choose from 'random_forest' or 'neural_net'.")
+            torch.save(model.state_dict(), "emnist_neural_net.pth")
 
 """ 
 Load model from saved path
@@ -127,7 +130,7 @@ Load model from saved path
 def load(model_path):
     if model_path == "emnist_random_forest.joblib":
         return joblib.load(model_path)
-    elif model_path == "emnist_neural_net.pt":
+    elif model_path == "emnist_neural_net.pth":
         model = EmnistNet()
         model.load_state_dict(torch.load(model_path))
         model.eval()
@@ -262,7 +265,14 @@ def predict(im_path, model, pad=5):
         cv2.imwrite(f"segmented/roi{i}.jpg", roi) # write ROI to folder for debugging
 
         # predict letter for ROI
-        pred += letters[model.predict([roi.flatten()])[0]]
+        if type(model) == EmnistNet:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            model = model.to(device)
+            model.eval()
+            probs = model(torch.from_numpy(roi.astype(np.float32)).to(device).reshape(1,1,28,28))
+            pred += letters[torch.argmax(probs[0])]
+        else:
+            pred += letters[model.predict([roi.flatten()])[0]]
 
         # draw bounding box
         cv2.rectangle(im, (x - pad, y - pad), (x2 + pad, y2 + pad), (0, 0, 255), 2)
@@ -277,7 +287,7 @@ if __name__ == "__main__":
     parser.add_argument("--train", action="store", type=str, choices=["random_forest", "neural_net"], required=False)
     parser.add_argument("--plot-data", action="store_true", required=False)
     parser.add_argument("--input", action="store", type=str, required=False)
-    parser.add_argument("--classifier", action="store", type=str, choices=["emnist_random_forest.joblib", "emnist_neural_net.pt"], required=False)
+    parser.add_argument("--classifier", action="store", type=str, choices=["emnist_random_forest.joblib", "emnist_neural_net.pth"], required=False)
     args = parser.parse_args()
 
     # train on emnist
