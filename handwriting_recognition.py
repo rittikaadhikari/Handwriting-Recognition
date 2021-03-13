@@ -229,21 +229,24 @@ def order_letters(bounding_rects):
 """
 Return text translation of provided image.
 """
-def predict(im_path, model, pad=5):
+def predict(im_path, model, pad=0):
     im = cv2.imread(im_path)
 
     # remove lines
     im = remove_lines(im)
+    # plt.imshow(im)
+    # plt.show()
     copy = im.copy()
 
     # get contours
     im_blur = cv2.GaussianBlur(im, (5, 5), 0)
     thresh = cv2.adaptiveThreshold(im_blur, 255, 1, 1, 11, 2)
     contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # print(contours)
 
     # sort contours & filter by area
     contours = sort_contours(contours)
-    contours = filter(lambda cnt: cv2.contourArea(cnt) > 300, contours)
+    contours = filter(lambda cnt: cv2.contourArea(cnt) > 50, contours)
 
     # find best candidate bounding boxes from contours
     bounding_rects = map(lambda cnt: (cv2.boundingRect(cnt)[0], cv2.boundingRect(cnt)[1], 
@@ -258,7 +261,11 @@ def predict(im_path, model, pad=5):
     for i, rect in enumerate(bounding_rects, 0):
         # compute ROI from provided bounding rectangle
         x, y, x2, y2 = rect
+        # print(x, y, x2, y2)
+        if x < pad or y < pad:
+            continue
         roi = copy[y - pad:y2 + pad, x - pad:x2 + pad]
+        # print(roi.shape)
         roi = cv2.resize(roi, (28, 28))
         roi = ~roi # invert to match dataset coloring
 
