@@ -11,6 +11,7 @@ scikit-learn = "*"
 emnist = "*"
 joblib = "*"
 argparse = "*"
+torch = "*"
 
 [dev-packages]
 
